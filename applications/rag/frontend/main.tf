@@ -190,4 +190,9 @@ resource "kubernetes_deployment" "rag_frontend_deployment" {
       }
     }
   }
+
+  timeouts {
+    create = "30m"
+    update = "30m"
+  }
 }
