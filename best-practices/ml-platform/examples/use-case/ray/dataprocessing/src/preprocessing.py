@@ -1,31 +1,36 @@
-import os
-import ray
-import pandas as pd
-from typing import List
-import urllib.request, urllib.error
-import time
-from google.cloud import storage
-import spacy
+import sys
+import logging
 import jsonpickle
+import os
+import pandas as pd
+import ray
 import re
+import spacy
+import time
+import urllib.error
+import urllib.request
+
+from google.cloud import storage
+from typing import List
 
 IMAGE_BUCKET = os.environ['PROCESSING_BUCKET']
 RAY_CLUSTER_HOST = os.environ['RAY_CLUSTER_HOST']
 GCS_IMAGE_FOLDER = 'flipkart_images'
 
+
+logging.config.fileConfig('logging.conf')
+logger = logging.getLogger('preprocessing')
+
+
 @ray.remote(num_cpus=1)
 def get_clean_df(df):
 
     def extract_url(image_list: str) -> List[str]:
-        image_list = image_list.replace('[', '')
-        image_list = image_list.replace(']', '')
-        image_list = image_list.replace('"', '')
-        image_urls = image_list.split(',')
-        return image_urls
+        return image_list.replace('[', '').replace(']', '').replace('"', '').split(',')
 
     def download_image(image_url, image_file_name, destination_blob_name):
         storage_client = storage.Client()
-        image_found_flag = False
+
         try:
             urllib.request.urlretrieve(image_url, image_file_name)
             bucket = storage_client.bucket(IMAGE_BUCKET)
@@ -34,14 +39,24 @@ def get_clean_df(df):
             print(
                 f"File {image_file_name} uploaded to {destination_blob_name}."
             )
-            image_found_flag = True
-        except urllib.error.HTTPError:
-            print("HTTPError exception")
+
+            return True
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                logger.warning(f"Image '{image_url}' not found")
+            elif err.code == 504:
+                logger.warning(f"Image '{image_url}' timed out")
+
+            logger.error("Unhandled HTTPError exception")
+            raise
         except urllib.error.URLError:
-            print("URLError exception")
+            logger.error("Unhandled URLError exception")
+            raise
         except:
-            print("Unknown exception")
-        return image_found_flag
+            logger.error("Unhandled exception")
+            raise
+
+        return False
 
     def prep_product_desc(df):
         # Cleaning the description text
@@ -85,6 +100,11 @@ def get_clean_df(df):
         products_with_no_image_count = 0
         products_with_no_image = []
         gcs_image_url = []
+
+        temporary_image_directory = 'tmp-images'
+        if not os.path.exists(temporary_image_directory):
+            os.makedirs(temporary_image_directory)
+
         image_found_flag = False
         for id, image_list in zip(df['uniq_id'], df['image']):
 
@@ -97,11 +117,13 @@ def get_clean_df(df):
             image_urls = extract_url(image_list)
             for index in range(len(image_urls)):
                 image_url = image_urls[index]
-                image_file_name = '{}_{}.jpg'.format(id, index)
-                destination_blob_name = GCS_IMAGE_FOLDER + '/' + image_file_name
-                image_found_flag = download_image(image_url, image_file_name, destination_blob_name)
+                image_file_name = f"{temporary_image_directory}/{id}_{index}.jpg"
+                destination_blob_name = f"{GCS_IMAGE_FOLDER}/{id}_{index}.jpg"
+                image_found_flag = download_image(
+                    image_url, image_file_name, destination_blob_name)
                 if image_found_flag:
-                    gcs_image_url.append('gs://' + IMAGE_BUCKET + '/' + destination_blob_name)
+                    gcs_image_url.append(
+                        'gs://' + IMAGE_BUCKET + '/' + destination_blob_name)
                     break
             if not image_found_flag:
                 # print("WARNING: No image: product ", id)
@@ -117,7 +139,8 @@ def get_clean_df(df):
 
     df_with_gcs_image_uri = get_product_image(df)
     df_with_desc = prep_product_desc(df_with_gcs_image_uri)
-    df_with_desc['attributes'] = df_with_desc['product_specifications'].apply(parse_attributes)
+    df_with_desc['attributes'] = df_with_desc['product_specifications'].apply(
+        parse_attributes)
 
     return df_with_desc
 
@@ -132,10 +155,23 @@ def split_dataframe(df, chunk_size=199):
 
 # This function invokes ray task
 def run_remote():
-    df = pd.read_csv('gs://'+IMAGE_BUCKET+'/flipkart_raw_dataset/flipkart_com-ecommerce_sample.csv')
-    df = df[['uniq_id','product_name','description','brand','image','product_specifications']]
-    runtime_env = {"pip": ["google-cloud-storage==2.16.0", "spacy==3.7.4", "jsonpickle==3.0.3"]}
-    ray.init("ray://"+RAY_CLUSTER_HOST, runtime_env=runtime_env)
+    df = pd.read_csv(
+        f"gs://{IMAGE_BUCKET}/flipkart_raw_dataset/flipkart_com-ecommerce_sample.csv")
+    df = df[['uniq_id',
+             'product_name',
+             'description',
+             'brand',
+             'image',
+             'product_specifications']]
+    runtime_env = {"pip": ["google-cloud-storage==2.16.0",
+                           "spacy==3.7.4",
+                           "jsonpickle==3.0.3"]}
+
+    if RAY_CLUSTER_HOST != "local":
+        ray.init(f"ray://{RAY_CLUSTER_HOST}", runtime_env=runtime_env)
+    else:
+        ray.init()
+
     print("STARTED")
     start_time = time.time()
     res = split_dataframe(df)
@@ -145,12 +181,22 @@ def run_remote():
     print(duration)
     ray.shutdown()
     result_df = pd.concat(results, axis=0, ignore_index=True)
-    result_df.to_csv('gs://'+IMAGE_BUCKET+'/flipkart_preprocessed_dataset/flipkart.csv', index=False)
+    result_df.to_csv('gs://'+IMAGE_BUCKET +
+                     '/flipkart_preprocessed_dataset/flipkart.csv', index=False)
     return result_df
 
 
 def main():
+
+    logger.info('Started')
+
+    logger.debug(f"RAY_CLUSTER_HOST={RAY_CLUSTER_HOST}")
+    logger.debug(f"IMAGE_BUCKET={IMAGE_BUCKET}")
+    logger.debug(f"GCS_IMAGE_FOLDER={GCS_IMAGE_FOLDER}")
+
     clean_df = run_remote()
+
+    logger.info('Finished')
 
 
 if __name__ == "__main__":
